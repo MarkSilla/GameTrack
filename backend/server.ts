@@ -3,8 +3,15 @@ import { handler } from './index';
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1');
-const defaultOrigin = process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5173';
-const allowedOrigins = new Set((process.env.CORS_ORIGIN || defaultOrigin).split(',').map(origin => origin.trim()).filter(Boolean));
+const defaultOrigins = process.env.NODE_ENV === 'production'
+  ? ['https://gametrack-beige.vercel.app']
+  : ['http://localhost:5173'];
+const configuredOrigins = (process.env.CORS_ORIGIN || '').split(',');
+const allowedOrigins = new Set(
+  [...defaultOrigins, ...configuredOrigins]
+    .map(origin => origin.trim().replace(/\/+$/, ''))
+    .filter(Boolean),
+);
 
 function applyCors(response: import('node:http').ServerResponse, request: import('node:http').IncomingMessage) {
   const origin = request.headers.origin;
@@ -18,7 +25,7 @@ function applyCors(response: import('node:http').ServerResponse, request: import
   }
   if (!origin) return true;
   response.setHeader('Vary', 'Origin');
-  if (!allowedOrigins.has(origin)) return false;
+  if (!allowedOrigins.has(origin.replace(/\/+$/, ''))) return false;
   response.setHeader('Access-Control-Allow-Origin', origin);
   response.setHeader('Access-Control-Allow-Credentials', 'true');
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-User-Id, X-User-Name, X-User-Email');

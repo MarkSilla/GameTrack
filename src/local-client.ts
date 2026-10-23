@@ -18,7 +18,9 @@ type RealtimeConnection = {
 };
 
 const LOCAL_USER_KEY = 'gt-local-user';
-const API_BASE_URL = String(import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+const API_BASE_URL = String(import.meta.env.VITE_API_URL || 'https://gametrack-itzg.onrender.com')
+  .trim()
+  .replace(/\/+$/, '');
 
 function resolveApiUrl(url: string) {
   return /^https?:\/\//i.test(url) ? url : `${API_BASE_URL}${url}`;

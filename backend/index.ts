@@ -86,13 +86,13 @@ function verifyPassword(password: string, stored: string) {
 
 function sessionCookie(token: string) {
   const secure = process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  const sameSite = process.env.COOKIE_SAMESITE || 'Lax';
+  const sameSite = process.env.COOKIE_SAMESITE || (process.env.NODE_ENV === 'production' ? 'None' : 'Lax');
   return `gt_session=${token}; HttpOnly; Path=/; SameSite=${sameSite}; Max-Age=604800${secure}`;
 }
 
 function expiredSessionCookie() {
   const secure = process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  const sameSite = process.env.COOKIE_SAMESITE || 'Lax';
+  const sameSite = process.env.COOKIE_SAMESITE || (process.env.NODE_ENV === 'production' ? 'None' : 'Lax');
   return `gt_session=; HttpOnly; Path=/; SameSite=${sameSite}; Max-Age=0${secure}`;
 }
 
