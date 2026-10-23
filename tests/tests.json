@@ -1,0 +1,35 @@
+[
+  {
+    "name": "Realtime game tracking remains live",
+    "sanity": true,
+    "viewport": "desktop",
+    "covers": ["realtime Windows Agent sync", "active game removal", "completed session persistence"],
+    "description": "Verifies the normal realtime tracking flow still works while session recovery is enabled.",
+    "steps": ["Start a configured game on the paired Windows PC", "Observe it in the GameTracker Live Monitor", "End the game from GameTracker"],
+    "expected": "The game appears without refresh, disappears from Live Monitor after ending, and the completed session remains in Session History."
+  },
+  {
+    "name": "Recovered session is visible after an Agent restart",
+    "viewport": "desktop",
+    "covers": ["crash/shutdown recovery", "persisted active session", "recovered session labeling"],
+    "description": "Verifies an active session persisted by the Windows Agent can become a durable recovered session after the Agent restarts while the game is no longer running.",
+    "steps": ["Start a configured game on the paired Windows PC", "Restart the Windows Agent while the session is active", "Open Session History after the Agent reconnects"],
+    "expected": "The interrupted session remains recorded and is visibly labeled as Recovered rather than being silently lost."
+  },
+  {
+    "name": "Recovered session keeps a defensible end time",
+    "viewport": "mobile",
+    "covers": ["offline session recording", "last known heartbeat end time", "mobile session details"],
+    "description": "Verifies recovered sessions show their recorded duration and explain that the end time is based on the last known Agent heartbeat.",
+    "steps": ["Open Session History on a phone-sized viewport", "Open a session labeled Recovered", "Inspect Session details"],
+    "expected": "The recovered session shows a duration, an end time, and a clear note that the interruption uses the last known Agent heartbeat as the estimated end."
+  },
+  {
+    "name": "Normal sessions are not mislabeled as recovered",
+    "viewport": "desktop",
+    "covers": ["normal session history", "recovery state distinction"],
+    "description": "Verifies normally closed sessions keep their normal presentation and are not marked as recovered.",
+    "steps": ["Open Session History containing a normally completed session", "Inspect the session row", "Open its details"],
+    "expected": "The normal session has no Recovered badge and is identified as a normally closed game session."
+  }
+]
