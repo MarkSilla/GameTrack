@@ -1,0 +1,61 @@
+# Tests
+
+## Test 1 - Show the polished dashboard and responsive controls [sanity]
+Viewport: desktop
+Covers: global GameIcon rendering, shared status badges, unified controls, dashboard usability
+Description: Verifies the main dashboard presents consistent game icons, status indicators, and controls without layout breakage.
+Steps:
+1. Open the GameTracker dashboard.
+2. Open Library and inspect a configured game card.
+3. Open the game details modal.
+Expected: Game identity uses the same icon system, status uses the shared badge style, controls have consistent focus/interaction styling, and the modal remains usable.
+
+## Test 2 - Recover from a cloud loading error
+Viewport: desktop
+Covers: cloud loading state, cloud error state, retry action, paired Windows PC state
+Description: Verifies a failed paired-PC state is communicated clearly and can be retried from the UI.
+QA Faults:
+```json
+[
+  {
+    "method": "GET",
+    "path": "/api/device/owned-state",
+    "status": 500,
+    "body_json": { "error": "simulated_failure" }
+  }
+]
+```
+Steps:
+1. Open the dashboard with a paired Windows PC.
+2. Trigger the paired-PC state load.
+3. Use the visible Retry action.
+Expected: GameTracker shows a clear error state with Retry instead of a blank area, and retrying starts the sync flow again.
+
+## Test 3 - Keep mobile Library and Session controls touch-friendly
+Viewport: mobile
+Covers: mobile sticky controls, compact Library cards, touch targets, no horizontal content scrolling
+Description: Verifies phone-sized layouts keep controls accessible while content stays inside the viewport.
+Steps:
+1. Open Library at 375x667.
+2. Scroll through the Library and use its search/filter controls.
+3. Open Sessions and use its filters and pagination.
+Expected: Controls remain easy to tap, compact cards fit the viewport, sticky toolbars remain usable while scrolling, and the page has no horizontal content scrolling.
+
+## Test 4 - Preserve realtime tracking and global icon consistency
+Viewport: desktop
+Covers: realtime game detection, active-session removal, completed session persistence, global GameIcon usage
+Description: Verifies UI polish does not change the realtime tracking workflow.
+Steps:
+1. Start a configured game on the Windows PC.
+2. Observe it in Live Monitor.
+3. End the game from GameTracker.
+Expected: The game appears without refresh, the active entry disappears after ending, the completed session remains in Session History, and the same game icon is used across the visible surfaces.
+
+## Test 5 - Show useful empty states on a new Library or Backlog
+Viewport: mobile
+Covers: empty-state messaging, responsive layout, clear no-data guidance
+Description: Verifies users receive useful guidance when a view has no matching data instead of an unexplained blank space.
+Steps:
+1. Open Library with filters that match no games.
+2. Open Backlog when no games are waiting.
+Expected: Each view shows a clear, readable empty-state message inside the content area and remains fully usable on mobile.
