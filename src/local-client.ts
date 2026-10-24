@@ -102,9 +102,18 @@ export const auth = {
     writeLocalUser(response.data.user);
     return response.data;
   },
-  async register(name: string, email: string, password: string, options: { inviteCode?: string; turnstileToken?: string } = {}) {
-    const response = await api.post<{ user: LocalUser }>('/api/auth/register', { name, email, password, ...options });
+  async register(name: string, email: string, password: string) {
+    const response = await api.post<{ user: LocalUser }>('/api/auth/register', { name, email, password });
     writeLocalUser(response.data.user);
+    return response.data;
+  },
+  async requestPasswordReset(email: string) {
+    const response = await api.post<{ message: string }>('/api/auth/forgot-password', { email });
+    return response.data;
+  },
+  async resetPassword(token: string, password: string) {
+    const response = await api.post<{ ok: boolean }>('/api/auth/reset-password', { token, password });
+    writeLocalUser(null);
     return response.data;
   },
   async signOut() {

@@ -1,7 +1,7 @@
 import { router, json, error, db, requireAuth } from './local-sdk';
 import { randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto';
 import { notifySubscribers, realtimeSubscriptionRoutes } from './realtime-subscribers';
-import { constantTimeEquals, hashDeviceAccessCode, hashSessionToken, rateLimit, requestIp, verifyDeviceAccessCode, verifyTurnstile } from './security';
+import { hashDeviceAccessCode, hashSessionToken, rateLimit, verifyDeviceAccessCode } from './security';
 
 const TABLE = 'gametracker_devices';
 const SCREEN_SHARE_TABLE = 'gametracker_screen_shares';
@@ -150,33 +150,83 @@ function publicUser(user: { userId: string; name?: string; email?: string }) {
   return { userId: user.userId, name: user.name || '', email: user.email || '' };
 }
 
+function passwordResetEmailConfig() {
+  const apiKey = String(process.env.RESEND_API_KEY || '').trim();
+  const from = String(process.env.RESEND_FROM || '').trim();
+  const appUrlValue = String(process.env.APP_URL || '').trim();
+  if (!apiKey || !from || !appUrlValue) return null;
+  let appUrl: URL;
+  try {
+    appUrl = new URL(appUrlValue);
+  } catch {
+    return null;
+  }
+  if (appUrl.protocol !== 'https:' && appUrl.hostname !== 'localhost' && appUrl.hostname !== '127.0.0.1') return null;
+  return { apiKey, from, appUrl: appUrl.origin };
+}
+
+async function sendResendEmail(email: string, subject: string, text: string, html: string, config: { apiKey: string; from: string }) {
+  let response: Response;
+  try {
+    response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: config.from,
+        to: [email],
+        subject,
+        text,
+        html,
+      }),
+    });
+  } catch (cause) {
+    console.error('Unable to send a GameTracker security email.', cause);
+    return false;
+  }
+  if (!response.ok) {
+    console.error(`Resend rejected a GameTracker security email (HTTP ${response.status}).`);
+    return false;
+  }
+  return true;
+}
+
+function sendPasswordResetEmail(email: string, resetUrl: string, config: { apiKey: string; from: string }) {
+  const text = `We received a request to reset your GameTracker password. Use this link within 30 minutes:\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email. Anyone with access to your email account can reset your GameTracker password, so secure that inbox if this request was unexpected.`;
+  const html = `<p>We received a request to reset your GameTracker password.</p><p><a href="${resetUrl}">Reset your password</a></p><p>This link expires in 30 minutes and can only be used once. If you did not request this, ignore this email. Anyone with access to your email account can reset your GameTracker password, so secure that inbox if this request was unexpected.</p>`;
+  return sendResendEmail(email, 'Reset your GameTracker password', text, html, config);
+}
+
+function sendPasswordChangedEmail(email: string, config: { apiKey: string; from: string }) {
+  const text = 'Your GameTracker password was changed. If you did not make this change, immediately secure your email account and use Forgot password to set a new password.';
+  const html = '<p>Your GameTracker password was changed.</p><p>If you did not make this change, immediately secure your email account and use Forgot password to set a new password.</p>';
+  return sendResendEmail(email, 'Your GameTracker password was changed', text, html, config);
+}
+
+async function deleteUserAuthSessions(userId: string) {
+  const sessionIds: string[] = [];
+  let nextToken: string | undefined;
+  for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
+    const page = await db.list<{ userId?: string }>('auth_sessions', { limit: 1000, nextToken });
+    sessionIds.push(...page.items.filter(session => session.userId === userId).map(session => String(session.id)));
+    nextToken = page.nextToken;
+    if (!nextToken) break;
+  }
+  if (sessionIds.length) await db.delete('auth_sessions', sessionIds);
+}
+
 export const handler = router({
   'GET /api/_healthcheck': [async () => json({ message: 'Success' })],
-  'GET /api/auth/config': [async () => json({
-    turnstileSiteKey: process.env.TURNSTILE_SITE_KEY || '',
-    inviteRequired: Boolean(process.env.REGISTRATION_INVITE_CODE),
-  })],
-
   'POST /api/auth/register': [
     rateLimit('auth-register-ip', 5, 60 * 60 * 1000),
-    async ({ body, request }) => {
-    const input = body as { email?: string; password?: string; name?: string; inviteCode?: string; turnstileToken?: string };
+    rateLimit('auth-register-global', 100, 60 * 60 * 1000, () => 'all'),
+    async ({ body }) => {
+    const input = body as { email?: string; password?: string; name?: string };
     const email = String(input.email || '').trim().toLowerCase();
     const password = String(input.password || '');
     const name = String(input.name || '').trim() || email.split('@')[0];
     if (email.length > 254 || !/^\S+@\S+\.\S+$/.test(email)) return error('Enter a valid email address.', 400);
     if (name.length > 100) return error('Name must be 100 characters or fewer.', 400);
     if (password.length < 8 || password.length > 128) return error('Password must be between 8 and 128 characters.', 400);
-    const inviteSecret = process.env.REGISTRATION_INVITE_CODE || '';
-    if (inviteSecret && !constantTimeEquals(String(input.inviteCode || ''), inviteSecret)) return error('A valid invite code is required to create an account.', 403);
-    const turnstileSecret = process.env.TURNSTILE_SECRET_KEY || '';
-    const turnstileToken = String(input.turnstileToken || '').trim();
-    if (turnstileSecret || turnstileToken) {
-      if (!turnstileSecret) return error('Human verification is not configured on the server.', 503);
-      if (!await verifyTurnstile(turnstileToken, requestIp(request))) return error('Human verification failed. Please try again.', 403);
-    } else if ((process.env.NODE_ENV === 'production' || process.env.REGISTRATION_REQUIRE_PROTECTION === 'true') && !inviteSecret) {
-      return error('Registration is disabled until an invite code or Turnstile is configured.', 503);
-    }
     const users = await db.list<{ email?: string }>('users', { limit: 1000 });
     if (users.items.some(user => user.email === email)) return error('An account with that email already exists.', 409);
     const userId = `user-${randomBytes(12).toString('hex')}`;
@@ -199,6 +249,74 @@ export const handler = router({
     if (!user?.userId || !user.passwordHash || !verifyPassword(password, user.passwordHash)) return error('Email or password is incorrect.', 401);
     const token = await createAuthSession({ userId: user.userId, name: user.name, email });
     return json({ user: publicUser({ userId: user.userId, name: user.name, email }) }, { headers: { 'Set-Cookie': sessionCookie(token) } });
+    },
+  ],
+
+  'POST /api/auth/forgot-password': [
+    rateLimit('auth-password-reset-ip', 5, 60 * 60 * 1000),
+    rateLimit('auth-password-reset-global', 100, 60 * 60 * 1000, () => 'all'),
+    async ({ body }) => {
+      const config = passwordResetEmailConfig();
+      if (!config) return error('Password recovery is not configured on the server yet.', 503);
+      const email = String((body as { email?: string } | undefined)?.email || '').trim().toLowerCase();
+      if (email.length > 254 || !/^\S+@\S+\.\S+$/.test(email)) {
+        return json({ message: 'If an account exists for that email, a reset link will be sent.' });
+      }
+      const users = await db.list<{ userId?: string; email?: string }>('users', { limit: 1000 });
+      const user = users.items.find(item => item.email === email && item.userId);
+      if (!user?.userId) return json({ message: 'If an account exists for that email, a reset link will be sent.' });
+
+      const previousTokens = await db.list<{ userId?: string }>('password_reset_tokens', { limit: 1000 });
+      const previousTokenIds = previousTokens.items.filter(token => token.userId === user.userId).map(token => String(token.id));
+      if (previousTokenIds.length) await db.delete('password_reset_tokens', previousTokenIds);
+
+      const token = randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+      const [tokenId] = await db.add('password_reset_tokens', [{ userId: user.userId, tokenHash: hashSessionToken(token), expiresAt }]);
+      const resetUrl = new URL('/', config.appUrl);
+      resetUrl.hash = `reset-password=${token}`;
+      const sent = await sendPasswordResetEmail(email, resetUrl.toString(), config);
+      if (!sent) await db.delete('password_reset_tokens', [tokenId]);
+      return json({ message: 'If an account exists for that email, a reset link will be sent.' });
+    },
+  ],
+
+  'POST /api/auth/reset-password': [
+    rateLimit('auth-password-complete-ip', 10, 15 * 60 * 1000),
+    async ({ body }) => {
+      const input = body as { token?: string; password?: string };
+      const token = String(input.token || '').trim();
+      const password = String(input.password || '');
+      if (!/^[a-f0-9]{64}$/i.test(token)) return error('This reset link is invalid or expired. Request a new one.', 400);
+      if (password.length < 8 || password.length > 128) return error('Password must be between 8 and 128 characters.', 400);
+
+      const tokens = await db.list<{ userId?: string; tokenHash?: string; expiresAt?: string; usedAt?: string }>('password_reset_tokens', { limit: 1000 });
+      const tokenHash = hashSessionToken(token);
+      const resetRecord = tokens.items.find(item => item.tokenHash === tokenHash);
+      const tokenExpiresAt = Date.parse(resetRecord?.expiresAt || '');
+      if (!resetRecord?.id || !resetRecord.userId || resetRecord.usedAt || !Number.isFinite(tokenExpiresAt) || tokenExpiresAt <= Date.now()) {
+        if (resetRecord?.id) await db.delete('password_reset_tokens', [resetRecord.id]);
+        return error('This reset link is invalid or expired. Request a new one.', 400);
+      }
+
+      const users = await db.list<{ userId?: string; email?: string; passwordHash?: string; id?: string }>('users', { limit: 1000 });
+      const user = users.items.find(item => item.userId === resetRecord.userId && typeof item.id === 'string');
+      if (!user?.id) return error('This reset link is invalid or expired. Request a new one.', 400);
+
+      const { id: tokenRecordId, ...tokenRecord } = resetRecord;
+      const [tokenConsumed] = await db.update('password_reset_tokens', [{ id: tokenRecordId, record: { ...tokenRecord, usedAt: new Date().toISOString() } }]);
+      if (!tokenConsumed) return error('This reset link is invalid or expired. Request a new one.', 400);
+      const { id: userRecordId, ...userRecord } = user;
+      await db.update('users', [{ id: userRecordId, record: { ...userRecord, passwordHash: hashPassword(password) } }]);
+      await deleteUserAuthSessions(resetRecord.userId);
+      await db.delete('password_reset_tokens', [tokenRecordId]);
+      const emailConfig = passwordResetEmailConfig();
+      if (user.email && emailConfig) {
+        await sendPasswordChangedEmail(user.email, emailConfig);
+      } else {
+        console.error('Unable to send a GameTracker password-change notice because email settings are missing.');
+      }
+      return json({ ok: true }, { headers: { 'Set-Cookie': expiredSessionCookie() } });
     },
   ],
 

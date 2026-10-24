@@ -74,25 +74,3 @@ export function verifyDeviceAccessCode(stored: string, candidate: string) {
   const actual = createHash('sha256').update(`${match[1]}:${candidate}`).digest('hex');
   return constantTimeEquals(actual, match[2]);
 }
-
-export async function verifyTurnstile(token: string, remoteIp?: string) {
-  const secret = process.env.TURNSTILE_SECRET_KEY;
-  if (!secret || !token) return false;
-
-  const body = new URLSearchParams({ secret, response: token });
-  if (remoteIp && remoteIp !== 'unknown') body.set('remoteip', remoteIp);
-
-  try {
-    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!response.ok) return false;
-    const result = await response.json() as { success?: boolean };
-    return result.success === true;
-  } catch {
-    return false;
-  }
-}
