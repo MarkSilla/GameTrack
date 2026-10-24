@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { auth } from './local-client';
-import { ArrowRight, Download, Gamepad2, KeyRound, MonitorDown, ShieldCheck, Sparkles, X } from 'lucide-react';
+import { ArrowRight, Download, Gamepad2, MonitorDown, ShieldCheck, Sparkles, X } from 'lucide-react';
 
 export default function AuthGate({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<Awaited<ReturnType<typeof auth.getUser>>>(null);
@@ -9,17 +9,17 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
   const [errorMessage, setErrorMessage] = useState('');
   const [registering, setRegistering] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
-  const [name, setName] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [middleName, setMiddleName] = useState('');
+  const [lastName, setLastName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [forgotPasswordMode, setForgotPasswordMode] = useState(false);
-  const [recoveryMessage, setRecoveryMessage] = useState('');
-  const [passwordResetToken, setPasswordResetToken] = useState(() => typeof window === 'undefined'
-    ? ''
-    : new URLSearchParams(window.location.hash.slice(1)).get('reset-password') || '');
-  const [passwordResetComplete, setPasswordResetComplete] = useState(false);
-  const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [verificationCode, setVerificationCode] = useState('');
+  const [forgotPasswordMode, setForgotPasswordMode] = useState(false);
+  const [emailVerificationMode, setEmailVerificationMode] = useState(false);
+  const [recoveryCodeMode, setRecoveryCodeMode] = useState(false);
+  const [recoveryMessage, setRecoveryMessage] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -48,8 +48,13 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
 
   const openAuth = (createAccount = false) => {
     setRegistering(createAccount);
+    setForgotPasswordMode(false);
+    setEmailVerificationMode(false);
+    setRecoveryCodeMode(false);
     setErrorMessage('');
+    setRecoveryMessage('');
     setPassword('');
+    setVerificationCode('');
     setAuthOpen(true);
   };
 
@@ -58,93 +63,70 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
     setErrorMessage('');
     setRecoveryMessage('');
     try {
-      if (forgotPasswordMode) {
-        const result = await auth.requestPasswordReset(email);
+      if (registering) {
+        if (emailVerificationMode) {
+          const result = await auth.verifyEmail(email, verificationCode);
+          setUser(result.user);
+          return;
+        }
+        const result = await auth.register(firstName, middleName, lastName, email, password);
+        setEmailVerificationMode(true);
+        setVerificationCode('');
+        setPassword('');
         setRecoveryMessage(result.message);
         return;
       }
-      const result = registering
-        ? await auth.register(name, email, password)
-        : await auth.signIn(email, password);
+      if (forgotPasswordMode) {
+        if (!recoveryCodeMode) {
+          const result = await auth.requestPasswordReset(email);
+          setRecoveryCodeMode(true);
+          setVerificationCode('');
+          setRecoveryMessage(result.message);
+          return;
+        }
+        if (password.length < 8 || password.length > 128) {
+          setErrorMessage('Password must be between 8 and 128 characters.');
+          return;
+        }
+        if (password !== confirmPassword) {
+          setErrorMessage('The passwords do not match.');
+          return;
+        }
+        await auth.resetPassword(email, verificationCode, password);
+        setForgotPasswordMode(false);
+        setRecoveryCodeMode(false);
+        setVerificationCode('');
+        setPassword('');
+        setConfirmPassword('');
+        setRecoveryMessage('Your password has been changed. Sign in with your new password. All active sessions were signed out.');
+        return;
+      }
+      const result = await auth.signIn(email, password);
       setUser(result.user);
     } catch (error) {
       const value = error as { code?: string; message?: string };
-      setErrorMessage(value.message || (registering ? 'Registration failed. Please try again.' : 'Sign-in failed. Please try again.'));
+      setErrorMessage(value.message || (registering ? 'Sign-up failed. Please try again.' : forgotPasswordMode ? 'Password recovery failed. Please try again.' : 'Sign-in failed. Please try again.'));
     } finally {
       setSigningIn(false);
     }
   };
 
-  const submitPasswordReset = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setErrorMessage('');
-    if (newPassword.length < 8 || newPassword.length > 128) {
-      setErrorMessage('Password must be between 8 and 128 characters.');
-      return;
-    }
-    if (newPassword !== confirmPassword) {
-      setErrorMessage('The passwords do not match.');
-      return;
-    }
+  const resendCode = async () => {
     setSigningIn(true);
+    setErrorMessage('');
     try {
-      await auth.resetPassword(passwordResetToken, newPassword);
-      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
-      setPasswordResetToken('');
-      setPasswordResetComplete(true);
-      setUser(null);
+      const result = registering
+        ? await auth.register(firstName, middleName, lastName, email, password)
+        : await auth.requestPasswordReset(email);
+      setVerificationCode('');
+      setRecoveryMessage(registering ? result.message : 'If an account exists for that email, a new verification code has been sent.');
     } catch (error) {
       const value = error as { message?: string };
-      setErrorMessage(value.message || 'Unable to reset your password. Request a new link and try again.');
+      setErrorMessage(value.message || 'Unable to send another code. Please try again.');
     } finally {
       setSigningIn(false);
     }
   };
-
-  const returnToSignIn = () => {
-    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
-    setPasswordResetToken('');
-    setPasswordResetComplete(false);
-    setPassword('');
-    setForgotPasswordMode(false);
-    setAuthOpen(true);
-  };
-
-  if (passwordResetToken || passwordResetComplete) {
-    return (
-      <div className="landing-reset-page">
-        <section className="landing-auth-dialog landing-reset-dialog" aria-labelledby="password-reset-title">
-          <span className="landing-auth-eyebrow"><span className="landing-auth-mark"><KeyRound size={15} /></span> GAMETRACKER ACCOUNT SECURITY</span>
-          {passwordResetComplete ? (
-            <>
-              <h1 id="password-reset-title">Password updated</h1>
-              <p>Your password has been changed and all active sessions have been signed out. Sign in again with your new password.</p>
-              <button className="landing-auth-submit" type="button" onClick={returnToSignIn}>Return to sign in <ArrowRight size={16} /></button>
-            </>
-          ) : (
-            <>
-              <h1 id="password-reset-title">Set a new password</h1>
-              <p>Choose a password you have not used before. This one-time link expires after 30 minutes.</p>
-              <form className="landing-auth-form" onSubmit={event => void submitPasswordReset(event)}>
-                <label className="landing-auth-field"><span>New password</span><input className="landing-auth-input" type="password" autoComplete="new-password" minLength={8} maxLength={128} value={newPassword} onChange={event => setNewPassword(event.target.value)} placeholder="At least 8 characters" required disabled={signingIn} /></label>
-                <label className="landing-auth-field"><span>Confirm new password</span><input className="landing-auth-input" type="password" autoComplete="new-password" minLength={8} maxLength={128} value={confirmPassword} onChange={event => setConfirmPassword(event.target.value)} placeholder="Enter it again" required disabled={signingIn} /></label>
-                {errorMessage && <div className="landing-error">{errorMessage}</div>}
-                <button className="landing-auth-submit" type="submit" disabled={signingIn}>{signingIn ? 'Updating password…' : 'Update password'} <ArrowRight size={16} /></button>
-              </form>
-              <div className="landing-auth-assurance"><ShieldCheck size={14} /><span>If you did not request this, secure your email account first.</span></div>
-              <button className="landing-auth-switch" type="button" onClick={() => {
-                window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
-                setPasswordResetToken('');
-                setUser(null);
-                setForgotPasswordMode(true);
-                setAuthOpen(true);
-              }}>Request another reset link</button>
-            </>
-          )}
-        </section>
-      </div>
-    );
-  }
 
   if (loading) return <div className="auth-loading">Checking your GameTracker account…</div>;
   if (user) return <>{children}</>;
@@ -202,33 +184,53 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
             <div className="landing-auth-heading">
               <div>
                 <span className="landing-auth-eyebrow"><span className="landing-auth-mark"><Gamepad2 size={15} /></span> GAMETRACKER ACCOUNT</span>
-                <h2 id="landing-auth-title">{forgotPasswordMode ? 'Reset your password' : registering ? 'Create your account' : 'Welcome back'}</h2>
-                <p>{forgotPasswordMode ? 'We will email a one-time reset link if an account matches.' : registering ? 'Create an account to start tracking your games.' : 'Sign in to open your GameTracker dashboard.'}</p>
+                <h2 id="landing-auth-title">{forgotPasswordMode ? 'Reset your password' : emailVerificationMode ? 'Verify your email' : registering ? 'Create your account' : 'Welcome back'}</h2>
+                <p>{emailVerificationMode ? 'Enter the 6-digit code we sent to your email. It expires in 10 minutes.' : forgotPasswordMode ? recoveryCodeMode ? 'Enter the 6-digit code from your email and choose a new password.' : 'We will email a one-time verification code if an account matches.' : registering ? 'Create an account to start tracking your games.' : 'Sign in to open your GameTracker dashboard.'}</p>
               </div>
               <button className="landing-auth-close" type="button" onClick={() => setAuthOpen(false)} aria-label="Close sign-in form"><X size={18} /></button>
             </div>
             <form className="landing-auth-form" onSubmit={event => { event.preventDefault(); void signIn(); }}>
-              {registering && !forgotPasswordMode && <label className="landing-auth-field"><span>Your name</span><input className="landing-auth-input" value={name} onChange={event => setName(event.target.value)} placeholder="How should we address you?" autoComplete="name" maxLength={100} required disabled={signingIn} /></label>}
-              <label className="landing-auth-field"><span>Email address</span><input className="landing-auth-input" value={email} onChange={event => setEmail(event.target.value)} placeholder="you@example.com" type="email" autoComplete="email" maxLength={254} required disabled={signingIn} /></label>
-              {!registering && !forgotPasswordMode && <label className="landing-auth-field"><span>Password</span><input className="landing-auth-input" value={password} onChange={event => setPassword(event.target.value)} placeholder="Enter your password" type="password" autoComplete="current-password" maxLength={128} required disabled={signingIn} /></label>}
-              {registering && !forgotPasswordMode && <label className="landing-auth-field"><span>Password</span><input className="landing-auth-input" value={password} onChange={event => setPassword(event.target.value)} placeholder="At least 8 characters" type="password" autoComplete="new-password" minLength={8} maxLength={128} required disabled={signingIn} /></label>}
-              {!registering && !forgotPasswordMode && <button className="landing-auth-forgot" type="button" onClick={() => { setForgotPasswordMode(true); setErrorMessage(''); setRecoveryMessage(''); }}>Forgot password?</button>}
+              {registering && !emailVerificationMode && <label className="landing-auth-field"><span>First name</span><input className="landing-auth-input" value={firstName} onChange={event => setFirstName(event.target.value)} placeholder="First name" autoComplete="given-name" maxLength={100} required disabled={signingIn} /></label>}
+              {registering && !emailVerificationMode && <label className="landing-auth-field"><span>Middle name <small>(optional)</small></span><input className="landing-auth-input" value={middleName} onChange={event => setMiddleName(event.target.value)} placeholder="Middle name (optional)" autoComplete="additional-name" maxLength={100} disabled={signingIn} /></label>}
+              {registering && !emailVerificationMode && <label className="landing-auth-field"><span>Last name</span><input className="landing-auth-input" value={lastName} onChange={event => setLastName(event.target.value)} placeholder="Last name" autoComplete="family-name" maxLength={100} required disabled={signingIn} /></label>}
+              <label className="landing-auth-field"><span>Email address</span><input className="landing-auth-input" value={email} onChange={event => setEmail(event.target.value)} placeholder="you@example.com" type="email" autoComplete="email" maxLength={254} required disabled={signingIn || emailVerificationMode || recoveryCodeMode} /></label>
+              {!forgotPasswordMode && !emailVerificationMode && <label className="landing-auth-field"><span>Password</span><input className="landing-auth-input" value={password} onChange={event => setPassword(event.target.value)} placeholder={registering ? 'At least 8 characters' : 'Enter your password'} type="password" autoComplete={registering ? 'new-password' : 'current-password'} minLength={registering ? 8 : undefined} maxLength={128} required disabled={signingIn} /></label>}
+              {(emailVerificationMode || recoveryCodeMode) && <label className="landing-auth-field"><span>6-digit email code</span><input className="landing-auth-input landing-auth-code" value={verificationCode} onChange={event => setVerificationCode(event.target.value.replace(/\D/g, '').slice(0, 6))} placeholder="000000" inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern="[0-9]{6}" required disabled={signingIn} /></label>}
+              {forgotPasswordMode && recoveryCodeMode && <>
+                <label className="landing-auth-field"><span>New password</span><input className="landing-auth-input" value={password} onChange={event => setPassword(event.target.value)} placeholder="At least 8 characters" type="password" autoComplete="new-password" minLength={8} maxLength={128} required disabled={signingIn} /></label>
+                <label className="landing-auth-field"><span>Confirm new password</span><input className="landing-auth-input" value={confirmPassword} onChange={event => setConfirmPassword(event.target.value)} placeholder="Enter it again" type="password" autoComplete="new-password" minLength={8} maxLength={128} required disabled={signingIn} /></label>
+              </>}
+              {!registering && !forgotPasswordMode && <button className="landing-auth-forgot" type="button" onClick={() => { setForgotPasswordMode(true); setRecoveryCodeMode(false); setErrorMessage(''); setRecoveryMessage(''); setVerificationCode(''); }}>Forgot password?</button>}
               {errorMessage && <div className="landing-error">{errorMessage}</div>}
               {recoveryMessage && <div className="landing-auth-success">{recoveryMessage}</div>}
-              <button className="landing-auth-submit" type="submit" disabled={signingIn}>{signingIn ? 'Please wait…' : forgotPasswordMode ? 'Send reset link' : registering ? 'Create account' : 'Sign in'} <ArrowRight size={16} /></button>
+              <button className="landing-auth-submit" type="submit" disabled={signingIn}>{signingIn ? 'Please wait…' : emailVerificationMode ? 'Verify email & create account' : forgotPasswordMode ? recoveryCodeMode ? 'Reset password' : 'Send verification code' : registering ? 'Send verification code' : 'Sign in'} <ArrowRight size={16} /></button>
             </form>
-            <div className="landing-auth-assurance"><ShieldCheck size={14} /><span>{registering ? 'No invite code or external verification needed.' : 'Your account and paired PC stay private.'}</span></div>
+            {(emailVerificationMode || recoveryCodeMode) && <button className="landing-auth-resend" type="button" disabled={signingIn} onClick={() => void resendCode()}>Send a new code</button>}
+            <div className="landing-auth-assurance"><ShieldCheck size={14} /><span>{registering ? 'Email verification helps protect your account.' : 'Your account and paired PC stay private.'}</span></div>
             <button className="landing-auth-switch" type="button" disabled={signingIn} onClick={() => {
-              if (forgotPasswordMode) {
+              if (emailVerificationMode) {
+                setEmailVerificationMode(false);
+                setVerificationCode('');
+                setRecoveryMessage('');
+              } else if (forgotPasswordMode && recoveryCodeMode) {
+                setRecoveryCodeMode(false);
+                setVerificationCode('');
+                setPassword('');
+                setConfirmPassword('');
+                setRecoveryMessage('');
+              } else if (forgotPasswordMode) {
                 setForgotPasswordMode(false);
                 setRecoveryMessage('');
               } else {
                 setRegistering(current => !current);
                 setPassword('');
+                setFirstName('');
+                setMiddleName('');
+                setLastName('');
               }
               setErrorMessage('');
             }}>
-              {forgotPasswordMode ? 'Back to sign in' : registering ? 'Already have an account? Sign in' : 'New here? Create an account'}
+              {emailVerificationMode ? 'Back to sign-up details' : forgotPasswordMode ? recoveryCodeMode ? 'Use a different email' : 'Back to sign in' : registering ? 'Already have an account? Sign in' : 'New here? Create an account'}
             </button>
           </section>
         </div>

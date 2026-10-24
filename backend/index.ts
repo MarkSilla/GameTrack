@@ -150,19 +150,11 @@ function publicUser(user: { userId: string; name?: string; email?: string }) {
   return { userId: user.userId, name: user.name || '', email: user.email || '' };
 }
 
-function passwordResetEmailConfig() {
+function resendEmailConfig() {
   const apiKey = String(process.env.RESEND_API_KEY || '').trim();
   const from = String(process.env.RESEND_FROM || '').trim();
-  const appUrlValue = String(process.env.APP_URL || '').trim();
-  if (!apiKey || !from || !appUrlValue) return null;
-  let appUrl: URL;
-  try {
-    appUrl = new URL(appUrlValue);
-  } catch {
-    return null;
-  }
-  if (appUrl.protocol !== 'https:' && appUrl.hostname !== 'localhost' && appUrl.hostname !== '127.0.0.1') return null;
-  return { apiKey, from, appUrl: appUrl.origin };
+  if (!apiKey || !from) return null;
+  return { apiKey, from };
 }
 
 async function sendResendEmail(email: string, subject: string, text: string, html: string, config: { apiKey: string; from: string }) {
@@ -190,10 +182,30 @@ async function sendResendEmail(email: string, subject: string, text: string, htm
   return true;
 }
 
-function sendPasswordResetEmail(email: string, resetUrl: string, config: { apiKey: string; from: string }) {
-  const text = `We received a request to reset your GameTracker password. Use this link within 30 minutes:\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email. Anyone with access to your email account can reset your GameTracker password, so secure that inbox if this request was unexpected.`;
-  const html = `<p>We received a request to reset your GameTracker password.</p><p><a href="${resetUrl}">Reset your password</a></p><p>This link expires in 30 minutes and can only be used once. If you did not request this, ignore this email. Anyone with access to your email account can reset your GameTracker password, so secure that inbox if this request was unexpected.</p>`;
-  return sendResendEmail(email, 'Reset your GameTracker password', text, html, config);
+function createEmailCode() {
+  return String(randomInt(0, 1_000_000)).padStart(6, '0');
+}
+
+function hashEmailCode(code: string, salt: string) {
+  return scryptSync(code, salt, 32).toString('hex');
+}
+
+function verifyEmailCode(code: string, salt: string, expectedHash: string) {
+  const actual = Buffer.from(hashEmailCode(code, salt), 'hex');
+  const expected = Buffer.from(expectedHash, 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function sendVerificationCodeEmail(email: string, code: string, config: { apiKey: string; from: string }) {
+  const text = `Your GameTracker email verification code is ${code}. It expires in 10 minutes. If you did not try to create an account, ignore this email.`;
+  const html = `<p>Your GameTracker email verification code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:8px">${code}</p><p>This code expires in 10 minutes. If you did not try to create an account, ignore this email.</p>`;
+  return sendResendEmail(email, 'Verify your GameTracker email', text, html, config);
+}
+
+function sendPasswordResetCodeEmail(email: string, code: string, config: { apiKey: string; from: string }) {
+  const text = `Your GameTracker password reset code is ${code}. It expires in 10 minutes. If you did not request this code, ignore this email and secure your email account.`;
+  const html = `<p>Your GameTracker password reset code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:8px">${code}</p><p>This code expires in 10 minutes. If you did not request this code, ignore this email and secure your email account.</p>`;
+  return sendResendEmail(email, 'Your GameTracker password reset code', text, html, config);
 }
 
 function sendPasswordChangedEmail(email: string, config: { apiKey: string; from: string }) {
@@ -214,25 +226,112 @@ async function deleteUserAuthSessions(userId: string) {
   if (sessionIds.length) await db.delete('auth_sessions', sessionIds);
 }
 
+async function deleteRecordsWhere(table: string, matches: (record: Record<string, unknown>) => boolean) {
+  const ids: string[] = [];
+  let nextToken: string | undefined;
+  for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
+    const page = await db.list<Record<string, unknown>>(table, { limit: 1000, nextToken });
+    ids.push(...page.items.filter(matches).map(record => String(record.id)));
+    nextToken = page.nextToken;
+    if (!nextToken) break;
+  }
+  if (ids.length) await db.delete(table, ids);
+}
+
+function fullName(firstName: string, middleName: string, lastName: string) {
+  return [firstName, middleName, lastName].filter(Boolean).join(' ');
+}
+
 export const handler = router({
   'GET /api/_healthcheck': [async () => json({ message: 'Success' })],
   'POST /api/auth/register': [
     rateLimit('auth-register-ip', 5, 60 * 60 * 1000),
     rateLimit('auth-register-global', 100, 60 * 60 * 1000, () => 'all'),
+    rateLimit('auth-register-email', 5, 15 * 60 * 1000, ({ body }) => String((body as { email?: string } | undefined)?.email || '').trim().toLowerCase()),
     async ({ body }) => {
-    const input = body as { email?: string; password?: string; name?: string };
+    const config = resendEmailConfig();
+    if (!config) return error('Email verification is not configured on the server. Set RESEND_API_KEY and RESEND_FROM in the backend environment.', 503);
+    const input = body as { email?: string; password?: string; firstName?: string; middleName?: string; lastName?: string };
     const email = String(input.email || '').trim().toLowerCase();
     const password = String(input.password || '');
-    const name = String(input.name || '').trim() || email.split('@')[0];
+    const firstName = String(input.firstName || '').trim();
+    const middleName = String(input.middleName || '').trim();
+    const lastName = String(input.lastName || '').trim();
     if (email.length > 254 || !/^\S+@\S+\.\S+$/.test(email)) return error('Enter a valid email address.', 400);
-    if (name.length > 100) return error('Name must be 100 characters or fewer.', 400);
+    if (!firstName || !lastName) return error('First name and last name are required.', 400);
+    if (firstName.length > 100 || middleName.length > 100 || lastName.length > 100) return error('Each name must be 100 characters or fewer.', 400);
     if (password.length < 8 || password.length > 128) return error('Password must be between 8 and 128 characters.', 400);
     const users = await db.list<{ email?: string }>('users', { limit: 1000 });
     if (users.items.some(user => user.email === email)) return error('An account with that email already exists.', 409);
-    const userId = `user-${randomBytes(12).toString('hex')}`;
-    await db.add('users', [{ userId, email, name, passwordHash: hashPassword(password) }]);
-    const token = await createAuthSession({ userId, name, email });
-    return json({ user: publicUser({ userId, name, email }) }, { headers: { 'Set-Cookie': sessionCookie(token) } });
+    const code = createEmailCode();
+    const codeSalt = randomBytes(16).toString('hex');
+    await deleteRecordsWhere('pending_registrations', record => record.email === email);
+    const [registrationId] = await db.add('pending_registrations', [{
+      email,
+      firstName,
+      middleName,
+      lastName,
+      passwordHash: hashPassword(password),
+      codeSalt,
+      codeHash: hashEmailCode(code, codeSalt),
+      attempts: 0,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    }]);
+    const sent = await sendVerificationCodeEmail(email, code, config);
+    if (!sent) {
+      await db.delete('pending_registrations', [registrationId]);
+      return error('Unable to send the verification email right now. Check the Resend sender configuration and try again.', 502);
+    }
+    return json({ message: 'A verification code has been sent to your email.' });
+    },
+  ],
+
+  'POST /api/auth/verify-email': [
+    rateLimit('auth-verify-email-ip', 10, 15 * 60 * 1000),
+    rateLimit('auth-verify-email-address', 8, 15 * 60 * 1000, ({ body }) => String((body as { email?: string } | undefined)?.email || '').trim().toLowerCase()),
+    async ({ body }) => {
+      const input = body as { email?: string; code?: string };
+      const email = String(input.email || '').trim().toLowerCase();
+      const code = String(input.code || '').trim();
+      if (!/^\d{6}$/.test(code)) return error('Enter the 6-digit code from your email.', 400);
+      const registrations = await db.list<{
+        email?: string; firstName?: string; middleName?: string; lastName?: string;
+        passwordHash?: string; codeSalt?: string; codeHash?: string; attempts?: number; expiresAt?: string;
+      }>('pending_registrations', { limit: 1000 });
+      const registration = registrations.items.find(item => item.email === email);
+      const expiresAt = Date.parse(registration?.expiresAt || '');
+      if (!registration?.id || !registration.firstName || !registration.lastName || !registration.passwordHash || !registration.codeSalt || !registration.codeHash || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        if (registration?.id) await db.delete('pending_registrations', [registration.id]);
+        return error('That verification code is invalid or expired. Request a new code.', 400);
+      }
+      if (Number(registration.attempts || 0) >= 5) {
+        await db.delete('pending_registrations', [registration.id]);
+        return error('Too many incorrect codes. Start sign-up again to get a new code.', 429);
+      }
+      if (!verifyEmailCode(code, registration.codeSalt, registration.codeHash)) {
+        const { id, ...record } = registration;
+        await db.update('pending_registrations', [{ id, record: { ...record, attempts: Number(record.attempts || 0) + 1 } }]);
+        return error('That verification code is incorrect.', 400);
+      }
+
+      const users = await db.list<{ email?: string }>('users', { limit: 1000 });
+      if (users.items.some(item => item.email === email)) {
+        await db.delete('pending_registrations', [registration.id]);
+        return error('An account with that email already exists.', 409);
+      }
+      await db.delete('pending_registrations', [registration.id]);
+      const name = fullName(registration.firstName, registration.middleName || '', registration.lastName);
+      const userId = `user-${randomBytes(12).toString('hex')}`;
+      await db.add('users', [{
+        userId, email, name,
+        firstName: registration.firstName,
+        middleName: registration.middleName || '',
+        lastName: registration.lastName,
+        passwordHash: registration.passwordHash,
+        emailVerified: true,
+      }]);
+      const session = await createAuthSession({ userId, name, email });
+      return json({ user: publicUser({ userId, name, email }) }, { headers: { 'Set-Cookie': sessionCookie(session) } });
     },
   ],
 
@@ -255,62 +354,76 @@ export const handler = router({
   'POST /api/auth/forgot-password': [
     rateLimit('auth-password-reset-ip', 5, 60 * 60 * 1000),
     rateLimit('auth-password-reset-global', 100, 60 * 60 * 1000, () => 'all'),
+    rateLimit('auth-password-reset-email', 5, 15 * 60 * 1000, ({ body }) => String((body as { email?: string } | undefined)?.email || '').trim().toLowerCase()),
     async ({ body }) => {
-      const config = passwordResetEmailConfig();
-      if (!config) return error('Password recovery is not configured on the server yet.', 503);
+      const config = resendEmailConfig();
+      if (!config) return error('Password recovery is not configured on the server. Set RESEND_API_KEY and RESEND_FROM in the backend environment.', 503);
       const email = String((body as { email?: string } | undefined)?.email || '').trim().toLowerCase();
       if (email.length > 254 || !/^\S+@\S+\.\S+$/.test(email)) {
-        return json({ message: 'If an account exists for that email, a reset link will be sent.' });
+        return json({ message: 'If an account exists for that email, a verification code will be sent.' });
       }
       const users = await db.list<{ userId?: string; email?: string }>('users', { limit: 1000 });
       const user = users.items.find(item => item.email === email && item.userId);
-      if (!user?.userId) return json({ message: 'If an account exists for that email, a reset link will be sent.' });
+      if (!user?.userId) return json({ message: 'If an account exists for that email, a verification code will be sent.' });
 
-      const previousTokens = await db.list<{ userId?: string }>('password_reset_tokens', { limit: 1000 });
-      const previousTokenIds = previousTokens.items.filter(token => token.userId === user.userId).map(token => String(token.id));
-      if (previousTokenIds.length) await db.delete('password_reset_tokens', previousTokenIds);
-
-      const token = randomBytes(32).toString('hex');
-      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-      const [tokenId] = await db.add('password_reset_tokens', [{ userId: user.userId, tokenHash: hashSessionToken(token), expiresAt }]);
-      const resetUrl = new URL('/', config.appUrl);
-      resetUrl.hash = `reset-password=${token}`;
-      const sent = await sendPasswordResetEmail(email, resetUrl.toString(), config);
-      if (!sent) await db.delete('password_reset_tokens', [tokenId]);
-      return json({ message: 'If an account exists for that email, a reset link will be sent.' });
+      await deleteRecordsWhere('password_reset_codes', record => record.userId === user.userId);
+      const code = createEmailCode();
+      const codeSalt = randomBytes(16).toString('hex');
+      const [codeId] = await db.add('password_reset_codes', [{
+        userId: user.userId,
+        email,
+        codeSalt,
+        codeHash: hashEmailCode(code, codeSalt),
+        attempts: 0,
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      }]);
+      const sent = await sendPasswordResetCodeEmail(email, code, config);
+      if (!sent) {
+        await db.delete('password_reset_codes', [codeId]);
+        return error('Unable to send a recovery email right now. Check the Resend sender configuration and try again.', 502);
+      }
+      return json({ message: 'If an account exists for that email, a verification code will be sent.' });
     },
   ],
 
   'POST /api/auth/reset-password': [
     rateLimit('auth-password-complete-ip', 10, 15 * 60 * 1000),
+    rateLimit('auth-password-complete-email', 8, 15 * 60 * 1000, ({ body }) => String((body as { email?: string } | undefined)?.email || '').trim().toLowerCase()),
     async ({ body }) => {
-      const input = body as { token?: string; password?: string };
-      const token = String(input.token || '').trim();
+      const input = body as { email?: string; code?: string; password?: string };
+      const email = String(input.email || '').trim().toLowerCase();
+      const code = String(input.code || '').trim();
       const password = String(input.password || '');
-      if (!/^[a-f0-9]{64}$/i.test(token)) return error('This reset link is invalid or expired. Request a new one.', 400);
+      if (email.length > 254 || !/^\S+@\S+\.\S+$/.test(email)) return error('Enter the email address where you received the code.', 400);
+      if (!/^\d{6}$/.test(code)) return error('Enter the 6-digit code from your email.', 400);
       if (password.length < 8 || password.length > 128) return error('Password must be between 8 and 128 characters.', 400);
 
-      const tokens = await db.list<{ userId?: string; tokenHash?: string; expiresAt?: string; usedAt?: string }>('password_reset_tokens', { limit: 1000 });
-      const tokenHash = hashSessionToken(token);
-      const resetRecord = tokens.items.find(item => item.tokenHash === tokenHash);
-      const tokenExpiresAt = Date.parse(resetRecord?.expiresAt || '');
-      if (!resetRecord?.id || !resetRecord.userId || resetRecord.usedAt || !Number.isFinite(tokenExpiresAt) || tokenExpiresAt <= Date.now()) {
-        if (resetRecord?.id) await db.delete('password_reset_tokens', [resetRecord.id]);
-        return error('This reset link is invalid or expired. Request a new one.', 400);
+      const resetCodes = await db.list<{ userId?: string; email?: string; codeSalt?: string; codeHash?: string; expiresAt?: string; attempts?: number }>('password_reset_codes', { limit: 1000 });
+      const resetCode = resetCodes.items.find(item => item.email === email);
+      const expiresAt = Date.parse(resetCode?.expiresAt || '');
+      if (!resetCode?.id || !resetCode.userId || !resetCode.codeSalt || !resetCode.codeHash || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        if (resetCode?.id) await db.delete('password_reset_codes', [resetCode.id]);
+        return error('That recovery code is invalid or expired. Request a new code.', 400);
+      }
+      if (Number(resetCode.attempts || 0) >= 5) {
+        await db.delete('password_reset_codes', [resetCode.id]);
+        return error('Too many incorrect codes. Request a new recovery code.', 429);
+      }
+      if (!verifyEmailCode(code, resetCode.codeSalt, resetCode.codeHash)) {
+        const { id, ...record } = resetCode;
+        await db.update('password_reset_codes', [{ id, record: { ...record, attempts: Number(record.attempts || 0) + 1 } }]);
+        return error('That recovery code is incorrect.', 400);
       }
 
       const users = await db.list<{ userId?: string; email?: string; passwordHash?: string; id?: string }>('users', { limit: 1000 });
-      const user = users.items.find(item => item.userId === resetRecord.userId && typeof item.id === 'string');
-      if (!user?.id) return error('This reset link is invalid or expired. Request a new one.', 400);
+      const user = users.items.find(item => item.userId === resetCode.userId && item.email === email && typeof item.id === 'string');
+      if (!user?.id) return error('That recovery code is invalid or expired. Request a new code.', 400);
 
-      const { id: tokenRecordId, ...tokenRecord } = resetRecord;
-      const [tokenConsumed] = await db.update('password_reset_tokens', [{ id: tokenRecordId, record: { ...tokenRecord, usedAt: new Date().toISOString() } }]);
-      if (!tokenConsumed) return error('This reset link is invalid or expired. Request a new one.', 400);
+      await db.delete('password_reset_codes', [resetCode.id]);
       const { id: userRecordId, ...userRecord } = user;
       await db.update('users', [{ id: userRecordId, record: { ...userRecord, passwordHash: hashPassword(password) } }]);
-      await deleteUserAuthSessions(resetRecord.userId);
-      await db.delete('password_reset_tokens', [tokenRecordId]);
-      const emailConfig = passwordResetEmailConfig();
+      await deleteUserAuthSessions(resetCode.userId);
+      const emailConfig = resendEmailConfig();
       if (user.email && emailConfig) {
         await sendPasswordChangedEmail(user.email, emailConfig);
       } else {

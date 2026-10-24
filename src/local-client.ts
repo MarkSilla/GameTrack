@@ -102,8 +102,12 @@ export const auth = {
     writeLocalUser(response.data.user);
     return response.data;
   },
-  async register(name: string, email: string, password: string) {
-    const response = await api.post<{ user: LocalUser }>('/api/auth/register', { name, email, password });
+  async register(firstName: string, middleName: string, lastName: string, email: string, password: string) {
+    const response = await api.post<{ message: string }>('/api/auth/register', { firstName, middleName, lastName, email, password });
+    return response.data;
+  },
+  async verifyEmail(email: string, code: string) {
+    const response = await api.post<{ user: LocalUser }>('/api/auth/verify-email', { email, code });
     writeLocalUser(response.data.user);
     return response.data;
   },
@@ -111,8 +115,8 @@ export const auth = {
     const response = await api.post<{ message: string }>('/api/auth/forgot-password', { email });
     return response.data;
   },
-  async resetPassword(token: string, password: string) {
-    const response = await api.post<{ ok: boolean }>('/api/auth/reset-password', { token, password });
+  async resetPassword(email: string, code: string, password: string) {
+    const response = await api.post<{ ok: boolean }>('/api/auth/reset-password', { email, code, password });
     writeLocalUser(null);
     return response.data;
   },
