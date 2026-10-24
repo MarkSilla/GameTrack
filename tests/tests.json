@@ -31,5 +31,21 @@
     "description": "Verifies normally closed sessions keep their normal presentation and are not marked as recovered.",
     "steps": ["Open Session History containing a normally completed session", "Inspect the session row", "Open its details"],
     "expected": "The normal session has no Recovered badge and is identified as a normally closed game session."
+  },
+  {
+    "name": "Screen sharing requires local approval",
+    "viewport": "desktop",
+    "covers": ["authenticated screen share request", "on-PC approval", "display selection"],
+    "description": "Verifies a dashboard screen-share request does not capture or stream anything before explicit approval and display selection on the Windows PC.",
+    "steps": ["Request to view the paired PC screen from the signed-in dashboard", "Decline the request in the Windows Agent", "Request again and approve a specific display"],
+    "expected": "Declining ends the request without starting capture. Approving requires a second on-PC display confirmation before the Agent shows its visible sharing control."
+  },
+  {
+    "name": "Screen sharing can be stopped on either device",
+    "viewport": "desktop",
+    "covers": ["visible PC stop control", "remote stop control", "screen stream cleanup"],
+    "description": "Verifies an active video-only WebRTC stream ends when Stop is pressed on the PC or dashboard.",
+    "steps": ["Approve a screen-share request on the Windows PC and press Start sharing", "Verify the remote dashboard receives video and the Agent window stays visible", "Stop from the dashboard, then repeat and stop from the Agent"],
+    "expected": "Both stop controls close the stream, report the ended state to the other side, and stop the captured media tracks."
   }
 ]

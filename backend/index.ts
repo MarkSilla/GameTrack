@@ -4,11 +4,26 @@ import { notifySubscribers, realtimeSubscriptionRoutes } from './realtime-subscr
 import { constantTimeEquals, hashDeviceAccessCode, hashSessionToken, rateLimit, requestIp, verifyDeviceAccessCode, verifyTurnstile } from './security';
 
 const TABLE = 'gametracker_devices';
+const SCREEN_SHARE_TABLE = 'gametracker_screen_shares';
+
+type ScreenShareRecord = {
+  share_id: string;
+  device_id: string;
+  owner_user_id: string;
+  state: 'requested' | 'streaming' | 'ended';
+  offer?: ScreenShareDescription;
+  answer?: ScreenShareDescription;
+  message?: string;
+  created_at: string;
+  expires_at: string;
+};
+type ScreenShareDescription = { type: 'offer' | 'answer'; sdp: string };
 
 type DeviceCommand =
   | { id: string; type: 'end_game'; game_id: string; requested_at: string }
   | { id: string; type: 'add_game'; game: { id: string; name: string; executable: string; iconUrl?: string; iconDataUrl?: string; platform: string; status: string; hours: number }; requested_at: string }
-  | { id: string; type: 'remove_game'; game_id: string; requested_at: string };
+  | { id: string; type: 'remove_game'; game_id: string; requested_at: string }
+  | { id: string; type: 'shutdown'; requested_at: string };
 
 type DeviceRecord = {
   device_id: string;
@@ -34,6 +49,30 @@ async function findDevice(deviceId: string) {
     if (!nextToken) break;
   }
   return undefined;
+}
+
+async function findScreenShare(shareId: string) {
+  let nextToken: string | undefined;
+  for (let pageNumber = 0; pageNumber < 20; pageNumber += 1) {
+    const page = await db.list<ScreenShareRecord>(SCREEN_SHARE_TABLE, { limit: 1000, nextToken });
+    const item = page.items.find(record => record.share_id === shareId);
+    if (item) return item;
+    nextToken = page.nextToken;
+    if (!nextToken) break;
+  }
+  return undefined;
+}
+
+async function listScreenShares() {
+  const records: Array<ScreenShareRecord & { id: string }> = [];
+  let nextToken: string | undefined;
+  for (let pageNumber = 0; pageNumber < 20; pageNumber += 1) {
+    const page = await db.list<ScreenShareRecord>(SCREEN_SHARE_TABLE, { limit: 1000, nextToken });
+    records.push(...page.items);
+    nextToken = page.nextToken;
+    if (!nextToken) break;
+  }
+  return records;
 }
 
 function authorizeAgent(input: { device_id?: string; access_code?: string }) {
@@ -324,10 +363,11 @@ export const handler = router({
   }],
 
   'POST /api/device/owned-command': [requireAuth(), async ({ body, user }) => {
-    const input = body as { device_id?: string; game_id?: string };
+    const input = body as { device_id?: string; game_id?: string; action?: 'shutdown' };
     const deviceId = String(input.device_id || '').trim();
     const gameId = String(input.game_id || '').trim();
-    if (!deviceId || !gameId) return error('device_id and game_id are required', 400);
+    if (!deviceId || (!gameId && input.action !== 'shutdown')) return error('device_id and game_id are required', 400);
+    if (input.action && input.action !== 'shutdown') return error('Unsupported device command.', 400);
     const state = await findDevice(deviceId);
     if (!state) return error('Device not found', 404);
     if (state.owner_user_id !== user!.userId) return error('This PC is not paired to your account.', 403);
@@ -343,17 +383,184 @@ export const handler = router({
         return error('A game-control command is already pending. Please wait for the Windows Agent to finish it.', 409);
       }
     }
-    const games = Array.isArray(state.games) ? state.games as Array<{ id?: string }> : [];
-    if (!games.some(item => item.id === gameId)) return error('Game is not configured on this device.', 404);
-    const active = Array.isArray(state.active) ? state.active as Array<{ gameId?: string }> : [];
-    if (!active.some(item => item.gameId === gameId)) return error('That game is not currently running.', 409);
-    const command: DeviceCommand = { id: `cmd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, type: 'end_game', game_id: gameId, requested_at: new Date().toISOString() };
+    let command: DeviceCommand;
+    if (input.action === 'shutdown') {
+      command = { id: `cmd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, type: 'shutdown', requested_at: new Date().toISOString() };
+    } else {
+      const games = Array.isArray(state.games) ? state.games as Array<{ id?: string }> : [];
+      if (!games.some(item => item.id === gameId)) return error('Game is not configured on this device.', 404);
+      const active = Array.isArray(state.active) ? state.active as Array<{ gameId?: string }> : [];
+      if (!active.some(item => item.gameId === gameId)) return error('That game is not currently running.', 409);
+      command = { id: `cmd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, type: 'end_game', game_id: gameId, requested_at: new Date().toISOString() };
+    }
     const updatedState: DeviceRecord = { ...state, pending_command: command };
     const ok = await db.update(TABLE, [{ id: state.id, record: updatedState }]);
     if (!ok[0]) return error('Unable to queue the game-control command.', 500);
     await notifySubscribers('device', deviceId, publicState(updatedState));
     return json({ ok: true, command });
   }],
+
+  'POST /api/device/screen-share': [
+    requireAuth(),
+    rateLimit('screen-share-owner-ip', 20, 60 * 1000),
+    async ({ body, user }) => {
+      const input = body as { device_id?: string; action?: 'start' | 'stop'; share_id?: string };
+      const deviceId = String(input.device_id || '').trim();
+      if (!deviceId || !input.action) return error('device_id and action are required', 400);
+      if (input.action !== 'start' && input.action !== 'stop') return error('Unsupported screen share action.', 400);
+      const device = await findDevice(deviceId);
+      if (!device) return error('Device not found', 404);
+      if (device.owner_user_id !== user!.userId) return error('This PC is not paired to your account.', 403);
+
+      if (input.action === 'stop') {
+        const shareId = String(input.share_id || '').trim();
+        const share = shareId ? await findScreenShare(shareId) : undefined;
+        if (!share || share.device_id !== deviceId || share.owner_user_id !== user!.userId) return error('Screen share not found.', 404);
+        if (share.state !== 'ended') {
+          const updated = { ...share, state: 'ended' as const, message: 'Screen sharing was stopped from the dashboard.' };
+          const ok = await db.update(SCREEN_SHARE_TABLE, [{ id: share.id, record: updated }]);
+          if (!ok[0]) return error('Unable to stop screen sharing.', 500);
+        }
+        return json({ ok: true });
+      }
+
+      const lastSync = Date.parse(String(device.synced_at || ''));
+      if (!Number.isFinite(lastSync) || Date.now() - lastSync > 20000) return error('The Windows Agent is offline. Start it before requesting screen sharing.', 409);
+      const existing = await listScreenShares();
+      const now = Date.now();
+      for (const expired of existing.filter(share => share.state !== 'ended' && Date.parse(share.expires_at) <= now)) {
+        const updated = { ...expired, state: 'ended' as const, message: 'Screen share request expired.' };
+        const ok = await db.update(SCREEN_SHARE_TABLE, [{ id: expired.id, record: updated }]);
+        if (!ok[0]) return error('Unable to expire an old screen share session.', 500);
+      }
+      const staleIds = existing.filter(share => share.state === 'ended' && now - Date.parse(share.created_at) > 24 * 60 * 60 * 1000).map(share => share.id);
+      if (staleIds.length > 0) {
+        const deleted = await db.delete(SCREEN_SHARE_TABLE, staleIds);
+        if (deleted.some(ok => !ok)) return error('Unable to clean up expired screen share sessions.', 500);
+      }
+      const activeShare = existing.find(share => share.device_id === deviceId
+        && share.state !== 'ended'
+        && Date.parse(share.expires_at) > now);
+      if (activeShare) return error('A screen share request or stream is already active for this PC.', 409);
+      const shareId = randomBytes(18).toString('base64url');
+      const share: ScreenShareRecord = {
+        share_id: shareId,
+        device_id: deviceId,
+        owner_user_id: user!.userId,
+        state: 'requested',
+        created_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
+      };
+      const [id] = await db.add(SCREEN_SHARE_TABLE, [share]);
+      if (!id) return error('Unable to create a screen share request.', 500);
+      return json({ share_id: shareId });
+    },
+  ],
+
+  'POST /api/device/screen-share/offer': [
+    requireAuth(),
+    rateLimit('screen-share-offer-ip', 20, 60 * 1000),
+    async ({ body, user }) => {
+      const input = body as { device_id?: string; share_id?: string; offer?: ScreenShareDescription };
+      const deviceId = String(input.device_id || '').trim();
+      const shareId = String(input.share_id || '').trim();
+      const sdp = String(input.offer?.sdp || '');
+      if (!deviceId || !shareId || !sdp || sdp.length > 1000000) return error('A valid screen share offer is required.', 400);
+      const share = await findScreenShare(shareId);
+      if (!share || share.device_id !== deviceId || share.owner_user_id !== user!.userId) return error('Screen share not found.', 404);
+      if (share.state !== 'requested' || Date.parse(share.expires_at) <= Date.now()) return error('Screen share request has expired.', 409);
+      const updated = { ...share, offer: { type: 'offer' as const, sdp } };
+      const ok = await db.update(SCREEN_SHARE_TABLE, [{ id: share.id, record: updated }]);
+      if (!ok[0]) return error('Unable to save the screen share offer.', 500);
+      return json({ ok: true });
+    },
+  ],
+
+  'GET /api/device/screen-share': [
+    requireAuth(),
+    async ({ query, user }) => {
+      const deviceId = String(query.device_id || '').trim();
+      const shareId = String(query.share_id || '').trim();
+      const share = shareId ? await findScreenShare(shareId) : undefined;
+      if (!share || share.device_id !== deviceId || share.owner_user_id !== user!.userId) return error('Screen share not found.', 404);
+      if (share.state !== 'ended' && Date.parse(share.expires_at) <= Date.now()) {
+        const updated = { ...share, state: 'ended' as const, message: 'Screen share request expired.' };
+        const ok = await db.update(SCREEN_SHARE_TABLE, [{ id: share.id, record: updated }]);
+        if (!ok[0]) return error('Unable to expire the screen share request.', 500);
+        return json({ state: updated.state, message: updated.message });
+      }
+      return json({ state: share.state, answer: share.answer || null, message: share.message || '' });
+    },
+  ],
+
+  'POST /api/device/screen-share/agent': [
+    rateLimit('screen-share-agent-ip', 120, 60 * 1000),
+    async ({ body }) => {
+      const input = body as {
+        device_id?: string;
+        access_code?: string;
+        action?: 'poll' | 'answer' | 'decline' | 'stop';
+        share_id?: string;
+        answer?: ScreenShareDescription;
+        message?: string;
+      };
+      const { deviceId, accessCode } = authorizeAgent(input);
+      if (!deviceId || !accessCode || !input.action) return error('device_id, access_code and action are required.', 400);
+      const device = await findDevice(deviceId);
+      if (!device || !verifyDeviceAccessCode(String(device.access_code || ''), accessCode)) return error('Invalid device credentials.', 401);
+
+      if (input.action === 'poll') {
+        const shares = await listScreenShares();
+        const currentTime = Date.now();
+        const currentSessions = [];
+        for (const share of shares.filter(item => item.device_id === deviceId && item.state !== 'ended')) {
+          if (Date.parse(share.expires_at) <= currentTime) {
+            const expired = { ...share, state: 'ended' as const, message: 'Screen share request expired.' };
+            const ok = await db.update(SCREEN_SHARE_TABLE, [{ id: share.id, record: expired }]);
+            if (!ok[0]) return error('Unable to expire the screen share session.', 500);
+            currentSessions.push({ share_id: share.share_id, state: expired.state, message: expired.message });
+          } else if (share.state === 'streaming') {
+            currentSessions.push({ share_id: share.share_id, state: share.state, message: share.message || '' });
+          }
+        }
+        const requested = shares.find(share => share.device_id === deviceId
+          && share.state === 'requested'
+          && Boolean(share.offer?.sdp)
+          && Date.parse(share.expires_at) > currentTime);
+        const sessions = shares
+          .filter(share => share.device_id === deviceId
+            && share.state === 'ended'
+            && currentTime - Date.parse(share.created_at) < 2 * 60 * 1000)
+          .map(share => ({ share_id: share.share_id, state: share.state, message: share.message || '' }));
+        return json({ request: requested ? { share_id: requested.share_id, offer: requested.offer } : null, sessions: [...currentSessions, ...sessions] });
+      }
+
+      const shareId = String(input.share_id || '').trim();
+      const share = shareId ? await findScreenShare(shareId) : undefined;
+      if (!share || share.device_id !== deviceId) return error('Screen share not found.', 404);
+      if (share.state !== 'requested' || Date.parse(share.expires_at) <= Date.now()) return error('Screen share request has expired.', 409);
+      if (input.action === 'answer') {
+        const sdp = String(input.answer?.sdp || '');
+        if (!sdp || sdp.length > 1000000) return error('A valid screen share answer is required.', 400);
+        const updated = {
+          ...share,
+          state: 'streaming' as const,
+          answer: { type: 'answer' as const, sdp },
+          expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        };
+        const ok = await db.update(SCREEN_SHARE_TABLE, [{ id: share.id, record: updated }]);
+        if (!ok[0]) return error('Unable to save the screen share answer.', 500);
+        return json({ ok: true });
+      }
+      if (input.action === 'decline' || input.action === 'stop') {
+        const updated = { ...share, state: 'ended' as const, message: String(input.message || (input.action === 'decline' ? 'Screen sharing was declined on the PC.' : 'Screen sharing was stopped on the PC.')).slice(0, 300) };
+        const ok = await db.update(SCREEN_SHARE_TABLE, [{ id: share.id, record: updated }]);
+        if (!ok[0]) return error('Unable to end the screen share.', 500);
+        return json({ ok: true });
+      }
+      return error('Unsupported screen share action.', 400);
+    },
+  ],
 
   'POST /api/device/command-result': [async ({ body }) => {
     const input = body as { device_id?: string; access_code?: string; command_id?: string; ok?: boolean; message?: string };

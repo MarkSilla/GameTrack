@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, Bell, Clock3, Gamepad2, MonitorDown, RefreshCw, ShieldCheck, WifiOff, XCircle } from 'lucide-react';
+import { Activity, Bell, Clock3, Gamepad2, MonitorDown, Power, RefreshCw, ShieldCheck, WifiOff, XCircle } from 'lucide-react';
 import { api, ws } from './local-client';
+import GameIcon from './GameIcon';
+import ScreenSharePanel from './ScreenSharePanel';
 
-type Game = { id: string; name: string; executable?: string; hours?: number };
+type Game = { id: string; name: string; executable?: string; iconUrl?: string; iconDataUrl?: string; hours?: number };
 type Session = { id: string; gameId: string; startedAt: string; durationSeconds?: number };
 type Active = { gameId: string; gameName: string; startedAt: string; elapsedSeconds?: number };
-type Command = { id: string; type: 'end_game'; game_id: string; requested_at: string };
-type LastCommand = { id: string; type: 'end_game'; game_id: string; completed_at: string; ok: boolean; message: string };
+type Command = { id: string; type: 'end_game' | 'shutdown'; game_id?: string; requested_at: string };
+type LastCommand = { id: string; type: 'end_game' | 'shutdown'; game_id?: string; completed_at: string; ok: boolean; message: string };
 type RemoteState = { device_id?: string; games: Game[]; sessions: Session[]; active: Active[]; synced_at: string; command?: Command | null; last_command?: LastCommand | null };
 
 function formatDuration(seconds: number) {
@@ -29,6 +31,7 @@ export default function RemoteDashboard() {
   const [errorMessage, setErrorMessage] = useState('');
   const [refreshing, setRefreshing] = useState(false);
   const [endingGameId, setEndingGameId] = useState('');
+  const [shuttingDown, setShuttingDown] = useState(false);
   const [actionMessage, setActionMessage] = useState('');
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const connectionRef = useRef<ReturnType<typeof ws.connect> | null>(null);
@@ -133,9 +136,26 @@ export default function RemoteDashboard() {
     }
   };
 
+  const shutdownPc = async () => {
+    if (!deviceId || shuttingDown || state?.command) return;
+    if (!window.confirm('Request shutdown of your paired Windows PC? The Windows Agent will ask for confirmation on that PC and schedule shutdown in 60 seconds if approved.')) return;
+    setShuttingDown(true);
+    setActionMessage('');
+    try {
+      await api.post('/api/device/owned-command', { device_id: deviceId, action: 'shutdown' });
+      setActionMessage('Shutdown request sent. Confirm it on the Windows PC to start the 60-second countdown.');
+      await load();
+    } catch (error) {
+      setActionMessage(error instanceof Error ? error.message : 'Could not send the shutdown request.');
+    } finally {
+      setShuttingDown(false);
+    }
+  };
+
   const totalHours = useMemo(() => (state?.games || []).reduce((sum, game) => sum + Number(game.hours || 0), 0), [state]);
   const longest = useMemo(() => (state?.sessions || []).reduce((max, session) => Math.max(max, Number(session.durationSeconds || 0)), 0), [state]);
   const active = state?.active?.[0];
+  const agentOnline = Boolean(state?.synced_at && Date.now() - Date.parse(state.synced_at) < 15000);
   const pendingGame = state?.games.find(game => game.id === state.command?.game_id);
   const lastGame = state?.games.find(game => game.id === state.last_command?.game_id);
 
@@ -165,11 +185,14 @@ export default function RemoteDashboard() {
             </section>
 
             {actionMessage && <div className="remote-notice">{actionMessage}</div>}
-            {state.last_command && <div className={`remote-command ${state.last_command.ok ? 'ok' : 'bad'}`}>{state.last_command.ok ? '✓' : '⚠'} {lastGame?.name || 'Game'}: {state.last_command.message}</div>}
+            {state.last_command && <div className={`remote-command ${state.last_command.ok ? 'ok' : 'bad'}`}>{state.last_command.ok ? '✓' : '⚠'} {state.last_command.type === 'shutdown' ? 'PC shutdown' : lastGame?.name || 'Game'}: {state.last_command.message}</div>}
+
+            <ScreenSharePanel deviceId={deviceId} available={agentOnline} />
 
             <div className="remote-stats"><div><small>Total playtime</small><b>{totalHours.toFixed(1)}h</b></div><div><small>Games</small><b>{state.games.length}</b></div><div><small>Sessions</small><b>{state.sessions.length}</b></div><div><small>Longest</small><b>{formatDuration(longest)}</b></div></div>
+            <button className="remote-end" onClick={() => void shutdownPc()} disabled={Boolean(!agentOnline || shuttingDown || state.command)}><Power size={16} />{state.command?.type === 'shutdown' ? 'Shutdown request pending…' : shuttingDown ? 'Sending shutdown request…' : 'Shut down paired PC'}</button>
 
-            <section className="remote-panel"><div className="remote-panel-head"><div><h3>Tracked games</h3><span>Your configured Windows games</span></div><span>{realtimeConnected ? 'LIVE' : 'SYNCING'}</span></div>{state.games.map(game => { const running = state.active.some(item => item.gameId === game.id); const disabled = Boolean(endingGameId || state.command); return <div className="remote-game-row" key={game.id}><div><b>{game.name}</b><small>{game.executable || ''} · {Number(game.hours || 0).toFixed(1)}h</small></div><div className="remote-actions"><span className="remote-badge">{running ? 'Playing' : 'Monitoring'}</span>{running && <button className="remote-mini-end" onClick={() => void endGame(game)} disabled={disabled}>{endingGameId === game.id ? 'Closing…' : 'End game'}</button>}</div></div>; })}</section>
+            <section className="remote-panel"><div className="remote-panel-head"><div><h3>Tracked games</h3><span>Your configured Windows games</span></div><span>{realtimeConnected ? 'LIVE' : 'SYNCING'}</span></div>{state.games.map(game => { const running = state.active.some(item => item.gameId === game.id); const disabled = Boolean(endingGameId || state.command); return <div className="remote-game-row" key={game.id}><div className="remote-game-info"><GameIcon game={game} size={24} /><div><b>{game.name}</b><small>{game.executable || ''} · {Number(game.hours || 0).toFixed(1)}h</small></div></div><div className="remote-actions"><span className="remote-badge">{running ? 'Playing' : 'Monitoring'}</span>{running && <button className="remote-mini-end" onClick={() => void endGame(game)} disabled={disabled}>{endingGameId === game.id ? 'Closing…' : 'End game'}</button>}</div></div>; })}</section>
 
             <section className="remote-panel"><div className="remote-panel-head"><div><h3>Recent sessions</h3><span>Latest recorded play sessions</span></div></div>{state.sessions.length ? state.sessions.slice(0, 12).map(session => { const game = state.games.find(item => item.id === session.gameId); return <div className="remote-session-row" key={session.id}><div><b>{game?.name || 'Unknown game'}</b><small>{new Date(session.startedAt).toLocaleString()}</small></div><strong>{formatDuration(Number(session.durationSeconds || 0))}</strong></div>; }) : <div className="remote-empty"><Clock3 size={18} /> No completed sessions yet.</div>}</section>
           </>

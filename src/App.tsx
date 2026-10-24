@@ -3,6 +3,7 @@ import { api, auth, ws } from './local-client';
 import CloudAgent from './CloudAgent';
 import AuthGate from './AuthGate';
 import GameIcon from './GameIcon';
+import ScreenSharePanel from './ScreenSharePanel';
 import { ActiveSessionCheckpoint, deleteActiveCheckpoint, listActiveCheckpoints, saveActiveCheckpoint } from './localSessionStore';
 import { ErrorState, LoadingState, StatusBadge } from './UI';
 import { AchievementWall, GamingInsights, GoalHistory } from './EnhancedInsights';
@@ -18,6 +19,7 @@ import {
   Library,
   MonitorDown,
   Plus,
+  Power,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -86,8 +88,8 @@ function formatDuration(seconds: number) {
 
 type CloudGame = { id: string; name: string; executable?: string; iconUrl?: string; iconDataUrl?: string; platform?: string; status?: Game['status']; hours?: number };
 type CloudActive = { gameId: string; gameName: string; startedAt: string; elapsedSeconds?: number };
-type CloudCommand = { id: string; type: 'end_game'; game_id: string; requested_at: string };
-type CloudLastCommand = { id: string; type: 'end_game'; game_id: string; completed_at: string; ok: boolean; message: string };
+type CloudCommand = { id: string; type: 'end_game' | 'shutdown'; game_id?: string; requested_at: string };
+type CloudLastCommand = { id: string; type: 'end_game' | 'shutdown'; game_id?: string; completed_at: string; ok: boolean; message: string };
 type CloudDeviceState = {
   device_id?: string;
   games: CloudGame[];
@@ -108,6 +110,7 @@ function MainApp() {
   const [cloudLoading, setCloudLoading] = useState(false);
   const [cloudRealtime, setCloudRealtime] = useState(false);
   const [cloudEnding, setCloudEnding] = useState('');
+  const [cloudShutdown, setCloudShutdown] = useState(false);
   const [cloudAction, setCloudAction] = useState('');
   const [pairingCodeInput, setPairingCodeInput] = useState('');
   const [pairingCodeExpiry, setPairingCodeExpiry] = useState('');
@@ -377,6 +380,48 @@ function MainApp() {
     }
   };
 
+  const shutdownPairedPc = async () => {
+    if (!pairedDeviceId || cloudShutdown || cloudState?.command) return;
+    if (!window.confirm('Request shutdown of your paired Windows PC? The Windows Agent will ask for confirmation on that PC and schedule shutdown in 60 seconds if approved.')) return;
+    setCloudShutdown(true);
+    setCloudAction('');
+    try {
+      await api.post('/api/device/owned-command', { device_id: pairedDeviceId, action: 'shutdown' });
+      setCloudAction('Shutdown request sent. Confirm it on the Windows PC to start the 60-second countdown.');
+      await loadCloudState(pairedDeviceId);
+    } catch (error) {
+      const value = error as { message?: string; response?: { status?: number; data?: { error?: string; message?: string } } };
+      const message = value.response?.data?.error || value.response?.data?.message || value.message || 'Could not send the shutdown request.';
+      setCloudAction(message);
+      showToast(message, 'error');
+    } finally {
+      setCloudShutdown(false);
+    }
+  };
+
+  const selectGameIcon = (file?: File) => {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      showToast('Choose an image file for the game icon.', 'error');
+      return;
+    }
+    if (file.size > 150 * 1024) {
+      showToast('Game icons must be 150 KB or smaller.', 'error');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const iconDataUrl = reader.result;
+      if (typeof iconDataUrl !== 'string' || !iconDataUrl.startsWith('data:image/')) {
+        showToast('Could not read that game icon image.', 'error');
+        return;
+      }
+      setNewGame(current => ({ ...current, iconDataUrl }));
+    };
+    reader.onerror = () => showToast('Could not read that game icon image.', 'error');
+    reader.readAsDataURL(file);
+  };
+
   const [games, setGames] = useState<Game[]>(seedGames);
   const [sessions, setSessions] = useState<Session[]>(seedSessions);
   const [activeView, setActiveView] = useState('Overview');
@@ -387,6 +432,7 @@ function MainApp() {
     executable: '',
     platform: 'PC',
     status: 'Backlog' as Game['status'],
+    iconDataUrl: '',
   });
   const [now, setNow] = useState(() => Date.now());
 
@@ -637,10 +683,10 @@ function MainApp() {
         await api.post('/api/device/owned-game-command', {
           device_id: pairedDeviceId,
           action: 'add',
-          game: { name: newGame.name.trim(), executable: newGame.executable.trim(), platform: 'PC', status: newGame.status, hours: 0 },
+          game: { name: newGame.name.trim(), executable: newGame.executable.trim(), iconDataUrl: newGame.iconDataUrl, platform: 'PC', status: newGame.status, hours: 0 },
         });
         setCloudAction(`${newGame.name.trim()} will be added to the Windows Agent.`);
-        setNewGame({ name: '', executable: '', platform: 'PC', status: 'Backlog' });
+        setNewGame({ name: '', executable: '', platform: 'PC', status: 'Backlog', iconDataUrl: '' });
         setShowAdd(false);
         await loadCloudState(pairedDeviceId);
       } catch (error) {
@@ -666,9 +712,10 @@ function MainApp() {
         status: newGame.status,
         hours: 0,
         color: 'blue',
+        iconDataUrl: newGame.iconDataUrl,
       },
     ]);
-    setNewGame({ name: '', executable: '', platform: 'PC', status: 'Backlog' });
+    setNewGame({ name: '', executable: '', platform: 'PC', status: 'Backlog', iconDataUrl: '' });
     setShowAdd(false);
   };
 
@@ -893,6 +940,7 @@ function MainApp() {
 
             {cloudAction && <div className="paired-action-notice">{cloudAction}</div>}
             {cloudState?.last_command && <div className={`paired-command ${cloudState.last_command.ok ? 'ok' : 'bad'}`}>{cloudState.last_command.ok ? '✓' : '⚠'} {cloudState.last_command.message}</div>}
+            {pairedDeviceId && <ScreenSharePanel deviceId={pairedDeviceId} available={agentOnline} />}
             <section className="connection-strip" aria-label="Windows Agent connection status">
               <span><i className={agentOnline ? 'device-dot online' : 'device-dot'} /> <b>{pairedDeviceId ? (agentOnline ? 'PC online' : 'PC offline') : 'No PC paired'}</b></span>
               <span><i className={cloudRealtime ? 'device-dot online' : 'device-dot'} /> <b>{syncStatus}</b></span>
@@ -1024,6 +1072,17 @@ function MainApp() {
               />
             </label>
             <label>
+              Game icon (optional, image up to 150 KB)
+              <input type="file" accept="image/*" onChange={e => selectGameIcon(e.currentTarget.files?.[0])} />
+            </label>
+            {newGame.iconDataUrl && (
+              <div className="game-icon-preview">
+                <GameIcon game={{ name: newGame.name, executable: newGame.executable, iconDataUrl: newGame.iconDataUrl }} size={32} />
+                <span>Selected game icon</span>
+                <button type="button" className="secondary" onClick={() => setNewGame(current => ({ ...current, iconDataUrl: '' }))}>Remove</button>
+              </div>
+            )}
+            <label>
               Windows executable
               <input
                 className={validationMessage && validationMessage.startsWith('Executable already') ? 'field-invalid' : ''}
@@ -1100,6 +1159,10 @@ function MainApp() {
                   <b>Windows PC</b>
                   <span className="connected-status"><i className={cloudRealtime ? 'dot connected' : 'dot'} /> {cloudRealtime ? 'Connected' : cloudState ? 'Cloud connected' : 'Connecting…'}</span>
                 </div>
+                  <button className="danger full" onClick={() => void shutdownPairedPc()} disabled={!agentOnline || cloudShutdown || Boolean(cloudState?.command)}>
+                    <Power size={15} /> {cloudShutdown ? 'Sending shutdown request…' : cloudState?.command?.type === 'shutdown' ? 'Shutdown request pending…' : 'Shut down this PC'}
+                  </button>
+                  <span className="connected-status">The Windows Agent will show a confirmation on the PC. Approved shutdowns have a 60-second cancel window.</span>
                   <button className="danger full" onClick={() => void disconnectDevice()}>
                   Disconnect &amp; regenerate pairing code
                 </button>

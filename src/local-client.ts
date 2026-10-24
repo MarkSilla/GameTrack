@@ -18,12 +18,16 @@ type RealtimeConnection = {
 };
 
 const LOCAL_USER_KEY = 'gt-local-user';
-const API_BASE_URL = String(import.meta.env.VITE_API_URL || 'https://gametrack-itzg.onrender.com')
+const API_BASE_URL = String(import.meta.env.VITE_API_URL || '')
   .trim()
   .replace(/\/+$/, '');
 
 function resolveApiUrl(url: string) {
-  return /^https?:\/\//i.test(url) ? url : `${API_BASE_URL}${url}`;
+  if (/^https?:\/\//i.test(url)) return url;
+  const isLocalDevelopment = typeof window !== 'undefined'
+    && ['localhost', '127.0.0.1'].includes(window.location.hostname);
+  const baseUrl = isLocalDevelopment ? '' : API_BASE_URL || 'https://gametrack-itzg.onrender.com';
+  return `${baseUrl}${url}`;
 }
 
 function writeLocalUser(user: LocalUser | null) {
